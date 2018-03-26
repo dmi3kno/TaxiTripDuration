@@ -1,0 +1,279 @@
+---
+title: "New York City Taxi Trip Duration"
+author: "Dmytro Perepolkin"
+output:
+  html_notebook:
+    code_folding: hide
+    theme: lumen
+    toc: yes
+    toc_float: yes
+---
+
+# Statement of Purpose
+
+>You need to build a model that predicts the total ride duration of taxi trips in New York City. The primary dataset is released by the NYC Taxi and Limousine Commission, which includes pickup time, geo-coordinates, number of passengers, and several other variables.
+>
+> https://www.kaggle.com/c/nyc-taxi-trip-duration 
+> 1.	Investigate the variables that influence the duration of the trip.
+> 2.	Based on individual trip attributes, predict the duration of each trip in the test set.
+
+# Introduction
+
+This Kaggle competition has been focused on incorporating external data and extensive feature engineering. This [thread](https://www.kaggle.com/c/nyc-taxi-trip-duration/discussion/36699) summarizes external datasources used in competition.
+
+I would like to highlight some of the external datasources that look promising:
+
+ - [Weather data](https://www.kaggle.com/mathijs/weather-data-in-new-york-city-2016)
+ - [Real time Traffic Speed Information](https://www.kaggle.com/crailtap/nyc-real-time-traffic-speed-data-feed)
+ - [Fastest Routes by Open Source Routing Machine](https://www.kaggle.com/oscarleo/new-york-city-taxi-with-osrm)
+ - [NYC Traffic accidents](https://www.kaggle.com/oscarleo/new-york-traffic-accidents-2016)
+ - [NYC Neighborhood locations](https://www.kaggle.com/perfectfit/nycneighborhoods)
+
+This Kaggle competition was plagued by [leakage](https://www.kaggle.com/c/nyc-taxi-trip-duration/discussion/36699), so the final standings of the contenders is not really representative of the strength of solution.
+
+For the purpose of this notebook, we will use only Weather Information and Open Source Routing Machine estimate of shortest route to predict trip duration.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=TRUE}
+#Sys.setenv("HTTPS_PROXY"="")
+#Sys.setenv("HTTP_PROXY"="")
+library(data.table)
+library(lubridate)
+library(leaflet)
+library(xgboost)
+library(ggplot2)
+library(forcats)
+library(hrbrthemes)
+```
+
+
+
+```{r}
+train <- fread("input/train.csv")
+test <- fread("input/test.csv")
+
+train[, datetime := ymd_hms(pickup_datetime)]
+test[, datetime := ymd_hms(pickup_datetime)]
+
+train[, c("YEARMODA", "wday", "time_dec"):=list(date(datetime),
+                                                wday(datetime),
+                                                hour(datetime)+minute(datetime)/60+second(datetime)/(60^2))]
+test[, c("YEARMODA", "wday", "time_dec"):=list(date(datetime),
+                                                wday(datetime),
+                                                hour(datetime)+minute(datetime)/60+second(datetime)/(60^2))]
+
+# remove unnecessary features
+train$dropoff_datetime  <- NULL
+train$pickup_datetime <- NULL
+test$pickup_datetime <- NULL
+
+```
+
+For motivation, lets take a small sample of the taxi trips and visualize pick up locations:
+
+```{r}
+set.seed(1234)
+train[sample(seq(nrow(train)), 1e4)] %>% 
+  leaflet() %>% addProviderTiles("CartoDB.Positron") %>%
+  addProviderTiles("Stamen.TonerLines",
+         options = providerTileOptions(opacity = 0.25)) %>%
+  addProviderTiles("Stamen.TonerLabels") %>% 
+  addCircleMarkers(~ pickup_longitude, ~pickup_latitude, 
+                   radius = 0.3, color = "red", fillOpacity = 0.7)
+```
+
+
+Daily weather information is also avaialable from NOAA website. API is implemented in several R packages, including [`GSODR`](https://cran.r-project.org/web/packages/GSODR/vignettes/GSODR.html). Here I searched and downloaded weather data for 2016 for Central Park weather data. Detailed description of the data included into the Global Summary of the day is found on [NOAA website]](https://www7.ncdc.noaa.gov/CDO/GSOD_DESC.txt).
+
+```{r}
+#library(GSODR)
+#load(system.file("extdata", "country_list.rda", package = "GSODR"))
+#load(system.file("extdata", "isd_history.rda", package = "GSODR"))
+#
+#station_locations <- merge(isd_history, country_list,
+#                               by.x = "CTRY", by.y = "FIPS", all.x = TRUE)
+#setDT(station_locations)
+#NYC_station <- station_locations[grepl("CENTRAL PARK", STN_NAME) & BEGIN<20160101 & END>20160630, STNID]
+#
+#rm(country_list, isd_history, station_locations)
+#
+# 
+# 
+#weather_df <- get_GSOD(years = 2016, station = NYC_station)
+#saveRDS(weather_df, "input/NYC_station_weather.Rds")
+
+weather_df <- readRDS("input/NYC_station_weather.Rds")
+setDT(weather_df)
+weather_df <- weather_df[,.SD, .SDcols=YEARMODA:RH]
+
+train <-merge(train, weather_df, by="YEARMODA", all.x=TRUE)
+test <-merge(test, weather_df, by="YEARMODA", all.x=TRUE)
+rm(weather_df)
+
+```
+
+
+Even though it is possible to do it offline using `osmr` package, [converting street network to an `igraph` object](https://rstudio-pubs-static.s3.amazonaws.com/278859_4b1f19cfba1640f3bd8a08b078ea99d0.html), we will import and use routing data published by one of the participants in this Kaggle competition.
+
+```{r}
+osrm_1 <- fread("input/OSRM/fastest_routes_train_part_1.csv")
+osrm_2 <- fread("input/OSRM/fastest_routes_train_part_2.csv")
+osrm_3 <- fread("input/OSRM/fastest_routes_test.csv")
+
+fastest_route <- rbindlist(list(osrm_1, osrm_2, osrm_3))
+fr_cols <- setdiff(names(fastest_route), c("starting_street", "end_street", "street_for_each_step", "distance_per_step", "travel_time_per_step", "step_maneuvers", "step_direction", "step_location_list"))
+fastest_route <- fastest_route[,.SD, .SDcols=fr_cols]
+
+train <- merge(train, fastest_route, all.x=TRUE, by="id")
+test <- merge(test, fastest_route, all.x=TRUE, by="id")
+rm(osrm_1, osrm_2, osrm_3, fr_cols, fastest_route)
+
+```
+
+Most interesting features here are `total_distance` and `total_travel_time`. We will also include `number_of_steps` as indication of the complexity of the trip.
+
+There's a big temptation to dive into the list-features included into this dataset, related to the details of the fastest trip, but we will refrain for doing this in the interest of time.
+
+# Feature engineering
+
+We will add the following calculated features:
+ 1) `Direct distance.` From the base dataset, we can calculate haversine distance, which would represent the distance between pickup and dropoff as the crow flies.
+ 2) `Speed limit`. We can use OSRM data to estimate "upper limit" on the travel speed, provided there's no traffic
+ 2) `Airport trips`. Lets create bounding block over both airports and the match coordinates of the start and finish of the trip with them. This way we will identify and mark trips bound to and from the airport.
+ 3)  `GPS off` trips. It appears that GPS was off for certain trips, so pickup and dropoff points are the same, but the trime travelled is not zero. We will mark these records in both train and test set and trust the algorithm will be able to pick them up
+
+```{r}
+# Direct Distance
+library(geosphere)
+train[,direct_distance := distHaversine(p1=as.matrix(cbind(pickup_longitude, pickup_latitude)),
+              p2=as.matrix(cbind(dropoff_longitude, dropoff_latitude)))]
+test[,direct_distance := distHaversine(p1=as.matrix(cbind(pickup_longitude, pickup_latitude)),
+              p2=as.matrix(cbind(dropoff_longitude, dropoff_latitude)))]
+
+# Upper limit on speed
+train[, speed_limit:=total_distance/total_travel_time]
+test[, speed_limit:=total_distance/total_travel_time]
+
+# Airport trips
+lgu_bb <- matrix(c(-73.88, -73.86, 40.76, 40.78), nrow=2, byrow = TRUE, dimnames = list(c("x", "y"),c("min", "max")))
+jfk_bb <- matrix(c(-73.83, -73.74, 40.62, 40.66), nrow=2, byrow = TRUE, dimnames = list(c("x", "y"),c("min", "max")))
+
+# helper function takes a matrix
+# can be used with sp::bbox or sf::st_bbox
+
+point_in_bbox <- function(long, lat, bbox){
+  bbox[1,1]<= long & bbox[1,2]>= long & bbox[2,1]<=lat & bbox[2,2]>=lat
+}
+
+train[,lg_pickup:= point_in_bbox(pickup_longitude, pickup_latitude, lgu_bb)]
+train[,lg_dropoff:= point_in_bbox(dropoff_longitude, dropoff_latitude, lgu_bb)]
+train[,jfk_pickup:= point_in_bbox(pickup_longitude, pickup_latitude, jfk_bb)]
+train[,jfk_dropoff:= point_in_bbox(dropoff_longitude, dropoff_latitude, jfk_bb)]
+
+test[,lg_pickup:= point_in_bbox(pickup_longitude, pickup_latitude, lgu_bb)]
+test[,lg_dropoff:= point_in_bbox(dropoff_longitude, dropoff_latitude, lgu_bb)]
+test[,jfk_pickup:= point_in_bbox(pickup_longitude, pickup_latitude, jfk_bb)]
+test[,jfk_dropoff:= point_in_bbox(dropoff_longitude, dropoff_latitude, jfk_bb)]
+
+
+# GPS off
+train[, no_coord:=(direct_distance<0.1)]
+test[,  no_coord:=(direct_distance<0.1)]
+
+# maybe need to limit cases going too far into the ocean?
+#train[order(-direct_distance)]
+train[, c("MONTH", "DAY"):=list(as.numeric(MONTH), as.numeric(DAY))]
+test[, c("MONTH", "DAY"):=list(as.numeric(MONTH), as.numeric(DAY))]
+
+train[, c("YEAR", "YEARMODA", "datetime", "I_HAIL", "I_THUNDER", "I_TORNADO_FUNNEL", "TEMP_CNT", "DEWP_CNT", "SLP_CNT", "STP_CNT", "VISIB_CNT", "WDSP_CNT", "MAX_FLAG", "MIN_FLAG", "PRCP_FLAG"):=NULL]
+
+test[, c("YEAR", "YEARMODA", "datetime", "I_HAIL", "I_THUNDER", "I_TORNADO_FUNNEL", "TEMP_CNT", "DEWP_CNT", "SLP_CNT", "STP_CNT", "VISIB_CNT", "WDSP_CNT", "MAX_FLAG", "MIN_FLAG", "PRCP_FLAG"):=NULL]
+
+train[, trip_duration:=log1p(trip_duration)]
+
+```
+
+# Feature importance
+
+Lets perform quick cross-validation to assess feature importance
+
+```{r}
+
+y <- "trip_duration"
+x <- setdiff(names(train), c(y, "id"))
+
+dtrain <- as.data.frame(unclass(train[,.SD,.SDcols=x]), stringsAsFactors=TRUE)
+dtest <- as.data.frame(unclass(test[,.SD,.SDcols=x]), stringsAsFactors=TRUE)
+
+dtrain <- xgb.DMatrix(data.matrix(dtrain),label = train[[y]])
+dtest <- xgb.DMatrix(data.matrix(dtest))
+
+set.seed(101)
+
+nfold <- 6 # number of folds for cross-validation
+
+xgb_params <- list(colsample_bytree = 0.7, #variables per tree 
+                   subsample = 0.7, #data subset per tree 
+                   booster = "gbtree", 
+                   max_depth = 15, #tree levels
+                   eta = 0.5, #shrinkage
+                   #gamma = 0.1,
+                   objective = "reg:linear",
+                   maximize=FALSE
+                   )
+
+cv.res <- xgb.cv(params=xgb_params, 
+                 data=dtrain, 
+                 nfold=nfold, 
+                 early_stopping_rounds=2,
+                 callbacks=list(cb.cv.predict(save_models = TRUE)),
+                 nrounds=50)
+
+```
+
+Lets visualize feature importance by fold
+
+```{r fig.height=6, fig.width=6}
+xgb_fi_list <- lapply(seq(nfold), function(i){
+  xgbfi <- xgb.importance(feature_names = x, model = cv.res$models[[i]])
+  xgbfi[order(-Gain), fold:=i]
+  xgbfi[1:10]
+})
+
+ggplot(Reduce(rbind, xgb_fi_list))+
+  geom_col(aes(x=forcats::fct_reorder(Feature, Gain), y=Gain))+
+  coord_flip()+
+  facet_wrap(~fold, nrow = 2)+
+  labs(title="Feature Importance",
+       subtitle="by fold",
+       x="Feature")+
+  theme_ipsum_rc(grid=FALSE)
+```
+Features listed here should intuitively make sense:
+
+ - Total distance - OSRM proposed route length
+ - Total travel time - OSRM proposed "no traffic" estimate
+ - Time decimal - time of the day
+ - Direct distance - distance as the crow flies
+ - Dropoff latitude
+ - Pickup longitude
+ - Pickup latitude
+ - Dropoff longitude
+ - Weekday
+ - Speed limit - theoretical speed limit as a ration of OSRM distance/time estimate
+
+# Prediction
+
+Now we can train on the whole dataset and predict on test data for making submission. It scores 
+
+```{r}
+best_round <- cv.res$niter
+
+res <- xgboost(data=dtrain, nrounds=floor(best_round*1.1), params=xgb_params)
+
+pred <- predict(res, dtest)
+xgb_result <- data.table(id=test$id, trip_duration=expm1(pred))
+fwrite(xgb_result, paste0("dp_taxi_trip_duration_", format(Sys.time(), "%Y%M%d%H%M%S"), ".csv"))
+
+```
+
+
